@@ -1,38 +1,145 @@
-import { type User, type InsertUser } from "@shared/schema";
-import { randomUUID } from "crypto";
-
-// modify the interface with any CRUD methods
-// you might need
+import { db } from "./db";
+import { eq, and, gte, lte, inArray } from "drizzle-orm";
+import {
+  regions, venues, employees, shifts, venueRequirements,
+  type Region, type InsertRegion,
+  type Venue, type InsertVenue,
+  type Employee, type InsertEmployee,
+  type Shift, type InsertShift,
+  type VenueRequirement, type InsertVenueRequirement,
+} from "@shared/schema";
 
 export interface IStorage {
-  getUser(id: string): Promise<User | undefined>;
-  getUserByUsername(username: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+  getRegions(): Promise<Region[]>;
+  getRegionByCode(code: string): Promise<Region | undefined>;
+  createRegion(data: InsertRegion): Promise<Region>;
+
+  getVenuesByRegion(regionId: number): Promise<Venue[]>;
+  getVenue(id: number): Promise<Venue | undefined>;
+  createVenue(data: InsertVenue): Promise<Venue>;
+  updateVenue(id: number, data: Partial<InsertVenue>): Promise<Venue | undefined>;
+
+  getEmployeesByRegion(regionId: number): Promise<Employee[]>;
+  getEmployee(id: number): Promise<Employee | undefined>;
+  createEmployee(data: InsertEmployee): Promise<Employee>;
+  updateEmployee(id: number, data: Partial<InsertEmployee>): Promise<Employee | undefined>;
+
+  getShiftsByRegionAndDateRange(regionId: number, startDate: string, endDate: string): Promise<Shift[]>;
+  getShiftsByEmployee(employeeId: number): Promise<Shift[]>;
+  getShift(id: number): Promise<Shift | undefined>;
+  createShift(data: InsertShift): Promise<Shift>;
+  updateShift(id: number, data: Partial<InsertShift>): Promise<Shift | undefined>;
+  deleteShift(id: number): Promise<boolean>;
+
+  getVenueRequirementsByRegion(regionId: number): Promise<VenueRequirement[]>;
+  createVenueRequirement(data: InsertVenueRequirement): Promise<VenueRequirement>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<string, User>;
-
-  constructor() {
-    this.users = new Map();
+export class DatabaseStorage implements IStorage {
+  async getRegions(): Promise<Region[]> {
+    return db.select().from(regions);
   }
 
-  async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
+  async getRegionByCode(code: string): Promise<Region | undefined> {
+    const [region] = await db.select().from(regions).where(eq(regions.code, code));
+    return region;
   }
 
-  async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
+  async createRegion(data: InsertRegion): Promise<Region> {
+    const [region] = await db.insert(regions).values(data).returning();
+    return region;
+  }
+
+  async getVenuesByRegion(regionId: number): Promise<Venue[]> {
+    return db.select().from(venues).where(eq(venues.regionId, regionId));
+  }
+
+  async getVenue(id: number): Promise<Venue | undefined> {
+    const [venue] = await db.select().from(venues).where(eq(venues.id, id));
+    return venue;
+  }
+
+  async createVenue(data: InsertVenue): Promise<Venue> {
+    const [venue] = await db.insert(venues).values(data).returning();
+    return venue;
+  }
+
+  async updateVenue(id: number, data: Partial<InsertVenue>): Promise<Venue | undefined> {
+    const [venue] = await db.update(venues).set(data).where(eq(venues.id, id)).returning();
+    return venue;
+  }
+
+  async getEmployeesByRegion(regionId: number): Promise<Employee[]> {
+    return db.select().from(employees).where(eq(employees.regionId, regionId));
+  }
+
+  async getEmployee(id: number): Promise<Employee | undefined> {
+    const [emp] = await db.select().from(employees).where(eq(employees.id, id));
+    return emp;
+  }
+
+  async createEmployee(data: InsertEmployee): Promise<Employee> {
+    const [emp] = await db.insert(employees).values(data).returning();
+    return emp;
+  }
+
+  async updateEmployee(id: number, data: Partial<InsertEmployee>): Promise<Employee | undefined> {
+    const [emp] = await db.update(employees).set(data).where(eq(employees.id, id)).returning();
+    return emp;
+  }
+
+  async getShiftsByRegionAndDateRange(regionId: number, startDate: string, endDate: string): Promise<Shift[]> {
+    const regionEmployees = await this.getEmployeesByRegion(regionId);
+    const empIds = regionEmployees.map((e) => e.id);
+    if (empIds.length === 0) return [];
+
+    return db.select().from(shifts).where(
+      and(
+        inArray(shifts.employeeId, empIds),
+        gte(shifts.date, startDate),
+        lte(shifts.date, endDate)
+      )
     );
   }
 
-  async createUser(insertUser: InsertUser): Promise<User> {
-    const id = randomUUID();
-    const user: User = { ...insertUser, id };
-    this.users.set(id, user);
-    return user;
+  async getShiftsByEmployee(employeeId: number): Promise<Shift[]> {
+    return db.select().from(shifts).where(eq(shifts.employeeId, employeeId));
+  }
+
+  async getShift(id: number): Promise<Shift | undefined> {
+    const [shift] = await db.select().from(shifts).where(eq(shifts.id, id));
+    return shift;
+  }
+
+  async createShift(data: InsertShift): Promise<Shift> {
+    const [shift] = await db.insert(shifts).values(data).returning();
+    return shift;
+  }
+
+  async updateShift(id: number, data: Partial<InsertShift>): Promise<Shift | undefined> {
+    const [shift] = await db.update(shifts).set(data).where(eq(shifts.id, id)).returning();
+    return shift;
+  }
+
+  async deleteShift(id: number): Promise<boolean> {
+    const result = await db.delete(shifts).where(eq(shifts.id, id)).returning();
+    return result.length > 0;
+  }
+
+  async getVenueRequirementsByRegion(regionId: number): Promise<VenueRequirement[]> {
+    const regionVenues = await this.getVenuesByRegion(regionId);
+    const venueIds = regionVenues.map((v) => v.id);
+    if (venueIds.length === 0) return [];
+
+    return db.select().from(venueRequirements).where(
+      inArray(venueRequirements.venueId, venueIds)
+    );
+  }
+
+  async createVenueRequirement(data: InsertVenueRequirement): Promise<VenueRequirement> {
+    const [req] = await db.insert(venueRequirements).values(data).returning();
+    return req;
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DatabaseStorage();
