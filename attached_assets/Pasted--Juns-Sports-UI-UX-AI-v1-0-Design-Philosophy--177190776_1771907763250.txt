@@ -1,0 +1,120 @@
+駿斯運動事業 (Juns Sports) - 前端 UI/UX 架構與 AI 開發規範書 (v1.0)
+📌 核心設計理念 (Design Philosophy)
+本系統為企業級高頻率操作的內部管理與出勤系統。UI/UX 核心風格定調為 「平淡的高級感 (Minimalist Premium) / Flat Design 2.0」。
+
+拒絕過度設計： 嚴禁 AI 隨意添加複雜的漸層背景、厚重的 3D 陰影或無意義的裝飾。
+
+細節即質感： 透過 1px 的極細邊框、精準的留白 (Negative Space)、以及克制的微互動 (Micro-interactions) 來引導使用者視覺。
+
+品牌一致性： 嚴格遵守駿斯 (Juns) 品牌色，以深藍、亮綠、湖水綠為核心操作反饋。
+
+1. 技術棧與開發環境 (Tech Stack)
+為了在 Replit 上達到最快的啟動速度、最佳的 AI 支援度與後續串接 Ragic 等資料庫的便利性，採用以下組合：
+
+核心框架： Vite + React + TypeScript (嚴格限制型別，防止 AI 傳遞錯誤 Props)
+
+樣式引擎： Tailwind CSS (禁止使用任何 Inline Style)
+
+動畫與微互動： Framer Motion + React Bits
+
+圖示系統： Lucide React (採用乾淨俐落的線條圖示)
+
+2. 專案目錄結構 (Replit-Optimized Structure)
+維持扁平且模組化的結構，確保 AI 在修改單一檔案時不會破壞全域邏輯：
+
+Plaintext
+src/
+├── components/
+│   ├── ui/               # 基礎共用 UI 元件 (Button, Card 等)
+│   │   └── react-bits/   # 存放從 React Bits 引入的獨立動效組件
+│   ├── features/         # 業務模塊 (ClockInWidget, MapSelector, BottomNav)
+│   └── layout/           # 版面框架 (Header, MainLayout)
+├── lib/                  # 工具函式 (tailwind-merge, clsx 等 utils)
+├── hooks/                # 自訂 Hooks (useGPSLocation, useCurrentTime)
+├── styles/               # globals.css (僅包含 Tailwind 指令與底層變數)
+└── App.tsx               # 主頁面容器 (不包含具體業務邏輯，僅作拼裝)
+3. 品牌設計語彙 (Design Tokens & Tailwind Config)
+所有顏色與視覺邊界必須被嚴格限制。請 AI 開發者將以下設定寫入 tailwind.config.js，並僅允許使用這些自訂變數。
+
+JavaScript
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
+  theme: {
+    extend: {
+      colors: {
+        juns: {
+          navy: '#183059',    // 品牌深藍：用於 Header、下班按鈕、重點文字
+          green: '#8CC63F',   // 品牌亮綠：用於 上班按鈕、成功驗證狀態
+          teal: '#1BB1A5',    // 品牌湖水綠：用於 次要強調、GPS定位光暈
+          surface: '#FCFCFD', // 冷白背景：取代死白的介面底色
+          border: '#EAEAEA'   // 極細邊框色：用於卡片分割
+        }
+      },
+      fontFamily: {
+        sans: ['Inter', '-apple-system', 'sans-serif'],
+        mono: ['SF Mono', 'ui-monospace', 'monospace'], // 確保大時鐘數字等寬
+      },
+      boxShadow: {
+        'flat': '0 2px 8px -2px rgba(0, 0, 0, 0.05)', // 高級微陰影，僅限少數浮動元件
+        'glow': '0 0 15px rgba(27, 177, 165, 0.3)',   // 湖水綠互動光暈
+      }
+    },
+  },
+  plugins: [],
+}
+4. UI 介面開發鐵律 (AI Guardrails)
+當 AI 協助生成或重構元件時，必須套用以下規則，違者視為 Bug：
+
+形狀與邊界 (Geometry)： * 禁用 rounded-full 作為卡片或方形按鈕的圓角。
+
+統一使用微圓角 rounded-md (如輸入框) 或 rounded-lg / rounded-xl (如主體卡片)。
+
+區塊分割必須優先使用 border border-juns-border 實體切割，不可過度依賴 shadow。
+
+文字排版 (Typography)：
+
+打卡首頁的「大時鐘」數字必須套用 font-mono 以及 style={{ fontVariantNumeric: 'tabular-nums' }}，確保秒數跳動時整體排版不會左右抖動。
+
+按鈕狀態與層級 (Button Hierarchy)：
+
+Primary (上班)： bg-juns-green text-white
+
+Secondary (下班)： bg-juns-navy text-white
+
+Tertiary (外勤簽到等)： bg-white border border-juns-border text-slate-600
+
+所有可點擊按鈕必須具備 active 狀態的反饋，例如：active:scale-[0.98]。
+
+5. React Bits 微動效整合規範 (Micro-interactions)
+為提升系統精緻度，專案導入 React Bits。但基於「企業生產力工具」的定位，必須極度克制地使用動畫。
+
+🟢 允許使用的動效模塊 (White-list)
+BlurText (模糊漸顯)：
+
+應用場景： 首頁「時間數字」與「日期」的初次載入。
+
+目的： 取代死板的 Fade-in，營造高階系統的啟動感。
+
+Spotlight Card (聚光燈邊框)：
+
+應用場景： 畫面中央的「GPS 地圖與場館選擇」資料卡片。
+
+目的： 平時以 1px 灰邊框隱藏於背景，當手指/游標互動時，亮起 juns-teal 的微弱光暈。
+
+ShinyText / Animated Content (光澤掃過)：
+
+應用場景： 「上班 / 下班」兩大核心操作按鈕的文字或背景。
+
+目的： 透過隱約的光澤流動，低調吸引注意力，增加按鈕的點擊衝動。
+
+Pill Nav / layout 漸變底色：
+
+應用場景： 底部的 Navigation Bar (首頁/出勤紀錄/忘打卡)。
+
+目的： 切換分頁時，Active 狀態的底色如水滴般滑動至下一個目標。
+
+🔴 禁用的動效模塊 (Black-list)
+嚴禁使用任何干擾閱讀的背景特效 (如：Beams, Hyperspeed, 粒子效果)。
+
+嚴禁使用 Glitch (雜訊/故障) 類型的文字動畫。
