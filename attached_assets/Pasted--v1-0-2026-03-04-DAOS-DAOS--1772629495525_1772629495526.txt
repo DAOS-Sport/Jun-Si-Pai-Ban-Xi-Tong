@@ -1,0 +1,410 @@
+打卡異常管理模組 — 前端架構技術文件
+版本：v1.0｜更新日期：2026-03-04｜作者：DAOS 開發團隊
+
+一、模組概覽
+打卡異常管理模組是 DAOS 群組功能戰情室的核心頁面之一，負責即時監控、展示與管理來自排班打卡系統的所有異常紀錄。
+
+技術棧
+層級	技術
+前端框架	React 18 + TypeScript
+狀態管理	TanStack React Query v5
+路由	wouter
+動畫	Framer Motion
+樣式	Tailwind CSS + shadcn/ui
+圖示	lucide-react
+HTTP 請求	內建 fetch（透過 apiRequest 封裝）
+後端	Express.js + TypeScript
+資料庫	PostgreSQL（Drizzle ORM）
+郵件通知	nodemailer（Gmail SMTP）
+檔案上傳	multer（multipart/form-data）
+檔案結構
+client/src/pages/anomaly-reports.tsx   # 主頁面（約 968 行，單檔案架構）
+server/routes.ts                       # 後端 API 路由
+server/storage.ts                      # 資料存取層（IStorage 介面 + DatabaseStorage 實作）
+shared/schema.ts                       # Drizzle 資料表定義 + Zod 驗證 Schema
+二、資料模型
+2.1 anomalyReports 資料表
+// shared/schema.ts
+anomalyReports = pgTable("anomaly_reports", {
+  id:            serial("id").primaryKey(),
+  employeeId:    integer("employee_id"),
+  employeeName:  text("employee_name"),
+  employeeCode:  text("employee_code"),
+  role:          text("role"),
+  lineUserId:    text("line_user_id"),
+  context:       text("context").notNull(),        // 異常類型，如 "GPS 定位打卡"
+  clockStatus:   text("clock_status"),              // "fail" | "success"
+  clockType:     text("clock_type"),                // "in" | "out"
+  clockTime:     text("clock_time"),                // "2026-03-04 20:25"
+  venueName:     text("venue_name"),
+  distance:      text("distance"),                  // "869m"
+  failReason:    text("fail_reason"),
+  errorMsg:      text("error_msg"),
+  userNote:      text("user_note"),                 // 員工自填備註
+  imageUrls:     text("image_urls").array(),        // 附件圖片路徑陣列
+  reportText:    text("report_text"),               // 完整報告純文字
+  resolution:    text("resolution").default("pending"),  // "pending" | "resolved"
+  resolvedNote:  text("resolved_note"),             // 管理者處理備註
+  createdAt:     timestamp("created_at").defaultNow().notNull(),
+})
+2.2 notificationRecipients 資料表
+notificationRecipients = pgTable("notification_recipients", {
+  id:               serial("id").primaryKey(),
+  email:            text("email").notNull(),
+  label:            text("label"),                    // 名稱標籤，如 "主管"
+  enabled:          boolean("enabled").default(true),
+  notifyNewReport:  boolean("notify_new_report").default(true),
+  notifyResolution: boolean("notify_resolution").default(true),
+  createdAt:        timestamp("created_at").defaultNow().notNull(),
+})
+2.3 前端 TypeScript Interface
+interface AnomalyReport {
+  id: string | number;       // 本地為 number，外部為 "ext-{id}"
+  source?: string;           // "local" | "external"
+  employeeId: number | null;
+  employeeName: string | null;
+  employeeCode: string | null;
+  role: string | null;
+  lineUserId: string | null;
+  context: string;
+  clockStatus: string | null;
+  clockType: string | null;
+  clockTime: string | null;
+  venueName: string | null;
+  distance: string | null;
+  failReason: string | null;
+  errorMsg: string | null;
+  userNote: string | null;
+  imageUrls: string[] | null;
+  reportText: string | null;
+  resolution: string | null;
+  resolvedNote: string | null;
+  createdAt: string;
+}
+三、後端 API 端點
+3.1 端點清單
+方法	路徑	說明
+POST	/api/anomaly-report	接收新的異常報告（JSON 或 multipart/form-data）
+GET	/api/anomaly-reports	取得所有異常報告（合併本地 + 外部資料來源）
+GET	/api/anomaly-reports/:id	取得單筆異常報告（支援 ext-{id} 格式）
+PATCH	/api/anomaly-reports/:id/resolution	更新單筆處理狀態
+PATCH	/api/anomaly-reports/batch/resolution	批量更新處理狀態
+DELETE	/api/anomaly-reports/:id	刪除單筆異常報告
+GET	/api/notification-recipients	取得所有通知收件者
+POST	/api/notification-recipients	新增通知收件者
+PATCH	/api/notification-recipients/:id	更新收件者設定
+DELETE	/api/notification-recipients/:id	刪除收件者
+POST	/api/test-email	發送測試郵件
+3.2 外部資料來源整合
+GET /api/anomaly-reports 的資料流：
+┌─────────────────────────┐
+│  前端 React Query        │
+│  queryKey: ["/api/       │
+│  anomaly-reports"]       │
+│  refetchInterval: 10s    │
+└──────────┬──────────────┘
+           │ GET
+           ▼
+┌─────────────────────────┐
+│  後端 Express Route      │
+│  GET /api/anomaly-reports│
+└──┬───────────┬──────────┘
+   │           │
+   │ Promise.all (並行)
+   │           │
+   ▼           ▼
+┌──────────┐ ┌────────────────────────────────┐
+│ 本地 DB   │ │ 外部 API                        │
+│ PostgreSQL│ │ smart-schedule-manager.replit.app│
+│           │ │ GET /api/anomaly-reports         │
+└──┬───────┘ └──────────┬─────────────────────┘
+   │                    │
+   │ source: "local"    │ source: "external"
+   │ id: number         │ id: "ext-{原始id}"
+   │                    │ imageUrls: 加上完整域名前綴
+   │                    │
+   └────────┬───────────┘
+            │ 合併 → 依 createdAt 降序排序
+            ▼
+     ┌──────────────┐
+     │ JSON Response │
+     │ [...merged]   │
+     └──────────────┘
+3.3 POST /api/anomaly-report 接收規格
+支援兩種 Content-Type：
+
+JSON 格式
+{
+  "context": "GPS 定位打卡",
+  "employee": {
+    "id": 1305374,
+    "name": "莊柏彥",
+    "employeeCode": "1305374",
+    "role": "櫃台",
+    "lineUserId": "U1377e3..."
+  },
+  "clockResult": {
+    "status": "fail",
+    "clockType": "out",
+    "date": "2026-03-04",
+    "time": "20:25",
+    "venueName": "新北高中",
+    "distance": 869,
+    "radius": 200,
+    "failReason": "不在任何場館範圍內"
+  },
+  "userNote": "員工備註內容",
+  "errorMsg": "GPS距離超出"
+}
+Multipart/form-data 格式
+data 欄位：JSON 字串（同上結構），也支援 json 或 payload 作為欄位名
+圖片欄位：支援 images、image、files、file、photo、photos
+限制：最多 5 張，每張最大 10MB
+格式：jpg / jpeg / png / gif / webp / heic / heif
+備註欄位名稱兼容
+後端會依序嘗試以下欄位名取得備註：
+
+data.userNote → data.user_note → data.note → data.remark → data.message → data.description
+3.4 CORS 設定
+所有 API 端點都啟用 CORS：
+
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, PATCH, PUT, DELETE, OPTIONS
+Access-Control-Allow-Headers: Content-Type, Authorization, Accept
+OPTIONS preflight 回應 204 No Content。
+
+四、前端元件架構
+4.1 元件樹
+AnomalyReportsPage (主頁面元件)
+├── 頁面標題區（圖示 + 標題 + 手動刷新按鈕）
+├── KPI 指標列
+│   ├── KpiCard × 5
+│   │   ├── 總異常數
+│   │   ├── 待解決
+│   │   ├── 今日異常
+│   │   ├── 最常見場館
+│   │   └── 最常見原因
+├── NotificationSettingsPanel（郵件通知設定面板）
+│   ├── 新增收件者表單（Email + 標籤）
+│   ├── 收件者列表
+│   │   └── RecipientRow × N
+│   │       ├── 啟用/停用 Toggle
+│   │       ├── 「新異常」通知 Toggle
+│   │       ├── 「處理變更」通知 Toggle
+│   │       └── 刪除按鈕
+│   └── 發送測試信按鈕
+├── 篩選列
+│   ├── 搜尋框（姓名/編號/場館）
+│   ├── 場館下拉選單（動態生成）
+│   ├── 狀態下拉選單（全部/待解決/已處理）
+│   └── 清除篩選按鈕
+├── 批量操作列（選中時出現）
+│   ├── 已選數量
+│   ├── 批量備註輸入
+│   ├── 「批量已處理」按鈕
+│   ├── 「批量待解決」按鈕
+│   └── 取消選擇按鈕
+├── 異常卡片列表
+│   └── AnomalyCard × N
+│       ├── 勾選框
+│       ├── 摘要列（員工名、狀態徽章、打卡類型、場館、原因、圖片數量）
+│       ├── 時間顯示（絕對時間 + 相對時間）
+│       └── 展開區域（點擊展開/收合）
+│           ├── DetailRow × 9（姓名/編號/職位/時間/場館/距離/原因/類型/異常類型）
+│           ├── 錯誤訊息區塊（紅色背景）
+│           ├── 用戶備註區塊（藍色背景）
+│           ├── 附件圖片（縮圖列表，點擊可開新分頁查看原圖）
+│           ├── 處理狀態操作區
+│           │   ├── 備註說明輸入框
+│           │   ├── 「標記已處理」或「改為待解決」按鈕
+│           │   └── 目前備註顯示
+│           └── 完整報告文字（<details> 可展開）
+└── 空狀態 / 載入中 / 錯誤狀態
+4.2 共用子元件
+元件	說明	位置
+KpiCard	KPI 指標卡片，含標題、數值、彩色圖示	同檔案內
+DetailRow	展開詳情中的單行欄位顯示（icon + label + value）	同檔案內
+AnomalyCard	單筆異常卡片，含展開/收合邏輯和處理狀態操作	同檔案內
+NotificationSettingsPanel	郵件通知收件者管理面板	同檔案內
+4.3 輔助函式
+函式	說明
+formatDate(dateStr)	ISO 時間字串 → YYYY/MM/DD HH:mm
+relativeTime(dateStr)	ISO 時間字串 → 相對時間（剛剛 / N 分鐘前 / N 小時前 / N 天前）
+五、狀態管理
+5.1 React Query 設定
+// 異常報告列表
+useQuery<AnomalyReport[]>({
+  queryKey: ["/api/anomaly-reports"],
+  refetchInterval: 10000,        // 每 10 秒自動刷新
+  refetchOnWindowFocus: true,    // 切回視窗時刷新
+})
+// 通知收件者列表
+useQuery<NotificationRecipient[]>({
+  queryKey: ["/api/notification-recipients"],
+})
+5.2 Mutations
+Mutation	觸發動作	成功後行為
+resolutionMutation	PATCH 單筆狀態	invalidate /api/anomaly-reports + toast
+batchMutation	PATCH 批量狀態	invalidate + toast + 清除選擇
+addMutation	POST 新增收件者	invalidate /api/notification-recipients + toast
+toggleMutation	PATCH 收件者設定	invalidate
+deleteMutation	DELETE 收件者	invalidate + toast
+testEmailMutation	POST 測試郵件	toast
+5.3 前端 Local State
+searchQuery: string             // 搜尋關鍵字
+venueFilter: string             // 場館篩選，"all" | 場館名稱
+statusFilter: string            // 狀態篩選，"all" | "pending" | "resolved"
+selectedIds: Set<string|number> // 已勾選的報告 ID
+batchNote: string               // 批量操作備註
+expanded: boolean               // (AnomalyCard 內) 展開/收合
+noteInput: string               // (AnomalyCard 內) 處理備註輸入
+showPanel: boolean              // (NotificationSettingsPanel 內) 面板開關
+newEmail: string                // (NotificationSettingsPanel 內) 新收件者 Email
+newLabel: string                // (NotificationSettingsPanel 內) 新收件者標籤
+5.4 計算屬性（useMemo）
+變數	依賴	說明
+venues	reports	從報告中提取不重複的場館名稱列表
+filteredReports	reports, searchQuery, venueFilter, statusFilter	套用搜尋和篩選後的報告列表
+5.5 KPI 計算
+totalReports  = reports.length                           // 總異常數
+pendingCount  = reports.filter(r.resolution !== "resolved")  // 待解決
+todayCount    = reports.filter(r.createdAt 是今天)         // 今日異常
+topVenue      = 出現次數最多的場館名稱                       // 最常見場館
+topReason     = 出現次數最多的 failReason                   // 最常見原因
+六、郵件通知系統
+6.1 架構
+              ┌──────────────────┐
+              │ Gmail SMTP       │
+              │ smtp.gmail.com   │
+              │ Port 465 (SSL)   │
+              └───────┬──────────┘
+                      │
+              ┌───────┴──────────┐
+              │ nodemailer       │
+              │ transporter      │
+              └───────┬──────────┘
+                      │
+    ┌─────────────────┼─────────────────┐
+    │                 │                 │
+    ▼                 ▼                 ▼
+sendAnomalyEmail  sendResolution   sendBatchResolution
+(新異常通知)       Email            Email
+                  (單筆處理通知)    (批量處理通知)
+6.2 發信觸發時機
+事件	觸發函式	收件者篩選
+POST 新異常報告	sendAnomalyEmail	notifyNewReport = true
+PATCH 單筆狀態變更	sendResolutionEmail	notifyResolution = true
+PATCH 批量狀態變更	sendBatchResolutionEmail	notifyResolution = true
+6.3 新異常郵件格式
+主旨：🚨 員工打卡異常 — 莊柏彥（新北高中）
+內文：
+員工打卡異常
+姓名：莊柏彥
+員工編號：1305374
+職位：櫃台
+場館：新北高中
+時間：2026-03-04 20:25
+原因：不在任何場館範圍內
+詳細請至 https://group-dashboard.replit.app 查看
+6.4 環境變數
+變數	說明
+GMAIL_USER	發件 Gmail 帳號
+GMAIL_APP_PASSWORD	Gmail 應用程式密碼（16 碼）
+七、動畫設計
+7.1 Framer Motion Variants
+containerVariants = {
+  hidden: { opacity: 0 },
+  visible: { opacity: 1, staggerChildren: 0.04 }
+}
+cardVariants = {
+  hidden: { opacity: 0, y: 16 },
+  visible: { opacity: 1, y: 0, duration: 0.4, ease: easeOut }
+}
+fadeIn = {
+  hidden: { opacity: 0, y: 12 },
+  visible: { opacity: 1, y: 0, duration: 0.45 }
+}
+7.2 互動動畫
+元素	動畫效果
+KPI 卡片	hover 時 y: -2，200ms
+展開箭頭	點擊旋轉 90°，200ms
+通知面板	展開/收合 height + opacity，300ms
+卡片展開區	AnimatePresence + height/opacity，300ms easeOut
+批量操作列	出現時 y: -8 → 0 + opacity
+八、UI/UX 設計規範
+8.1 狀態視覺系統
+狀態	圖示	邊框色	背景色	徽章色
+待解決 (fail)	ShieldAlert 紅	orange-200	white	orange 背景
+待解決 (其他)	FileWarning 橘	orange-200	white	orange 背景
+已處理	CheckCircle2 綠	green-200	green-50/30	green 背景
+選中	—	ring-2 blue-400	—	—
+8.2 資訊區塊色彩
+區塊	背景色	邊框色
+錯誤訊息	red-50/60	red-200/60
+用戶備註	blue-50/60	blue-200/60
+處理狀態	gray-50/80	gray-200/60
+8.3 Dark Mode 支援
+所有元素均有 dark: Tailwind 變體，遵循 zinc 色系。
+
+8.4 RWD 響應式
+KPI 列：flex-wrap，單卡 min-w-[150px]
+詳情格線：grid-cols-1 sm:grid-cols-2 lg:grid-cols-3
+時間顯示：hidden sm:block（小螢幕隱藏）
+處理區：flex-col sm:flex-row
+九、data-testid 對照表
+區域	testid 格式	說明
+頁面	page-anomaly-reports	頁面根節點
+標題	text-page-title	頁面標題
+刷新	button-refresh	手動刷新按鈕
+KPI	text-kpi-{title}	KPI 數值
+搜尋	input-search	搜尋輸入框
+篩選	select-venue, select-status	下拉篩選
+清除	button-clear-filters	清除篩選
+卡片	card-anomaly-{id}	單張異常卡片
+勾選	checkbox-{id}	勾選框
+展開	button-expand-{id}	展開按鈕
+員工	text-anomaly-employee-{id}	員工姓名
+狀態	badge-resolution-{id}	狀態徽章
+時間	text-anomaly-time-{id}	時間顯示
+詳情	detail-anomaly-{id}	展開詳情區
+圖片	img-anomaly-{id}-{index}	附件圖片
+備註	input-note-{id}	處理備註輸入
+處理	button-resolve-{id}	標記已處理
+退回	button-unresolve-{id}	改為待解決
+報告	toggle-report-text-{id}	完整報告展開
+通知	button-toggle-notifications	通知面板開關
+收件	recipient-{id}	收件者行
+全選	button-select-all	全選按鈕
+批量	button-batch-resolve, button-batch-pending	批量操作
+空態	text-empty-state	空狀態文字
+列表	list-anomaly-reports	報告列表容器
+十、跨系統整合注意事項
+10.1 外部資料來源
+來源：https://smart-schedule-manager.replit.app/api/anomaly-reports
+合併策略：外部報告 ID 加上 ext- 前綴避免衝突
+圖片 URL：外部報告的相對路徑自動補上完整域名
+容錯：外部 API 不可用時不影響本地資料展示（catch 回傳空陣列）
+10.2 POST 接收端
+本地 dashboard 也有 POST /api/anomaly-report，可直接接收異常報告
+目前主要資料來自外部系統，透過 GET 拉取
+兩套資料合併後統一在前端展示
+10.3 圖片存取
+來源	圖片路徑格式
+本地	/uploads/anomaly-reports/{filename}
+外部	https://smart-schedule-manager.replit.app/uploads/anomaly-reports/{filename}
+十一、效能考量
+項目	策略
+自動刷新	10 秒輪詢（refetchInterval: 10000）
+圖片載入	loading="lazy" + 載入失敗 fallback
+外部 API 超時	fetch 預設超時，失敗不阻塞
+合併排序	伺服器端完成，前端直接使用
+動畫	staggerChildren 0.04s，避免大量卡片同時渲染
+選擇狀態	Set 資料結構，O(1) 查詢/增刪
+十二、未來擴展方向
+分頁/虛擬捲動 — 當報告數量超過數百筆時，加入分頁或 react-window 虛擬列表
+日期範圍篩選 — 加入時間區間選擇器
+匯出功能 — CSV / Excel 匯出
+Push 通知 — 除了 Gmail 外加入 LINE Notify / Webhook
+權限控制 — 管理者才能操作「處理」狀態
+圖片預覽 — Lightbox 元件，不需開新分頁
+統計圖表 — 異常趨勢折線圖、場館分佈圓餅圖
