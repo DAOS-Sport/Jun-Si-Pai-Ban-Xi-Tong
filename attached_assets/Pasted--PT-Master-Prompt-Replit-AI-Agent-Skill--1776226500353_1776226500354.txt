@@ -1,0 +1,575 @@
+# PT 排班系統｜完整修改 Master Prompt
+# 使用方式：將此檔案全文貼入 Replit AI Agent 對話框
+
+---
+
+## 🧠 第一步：載入品牌規範 Skill（必須先執行）
+
+請先讀取專案中的品牌規範檔案：
+  .claude/skills/pt-scheduling-brand/SKILL.md
+
+這份 Skill 定義了本專案所有 UI 的色彩、元件、RWD 規則。
+**以下所有修改的 UI 部分，都必須嚴格遵守 Skill 中的規範。**
+包含但不限於：
+- Table 外層必須有 `overflow-x-auto w-full`
+- Dialog 必須有 `max-h-[90vh] overflow-y-auto mx-4`
+- Badge 色票使用 Skill 定義的班次類型色碼
+- 打卡回饋必須有視覺 Alert（不得靜默）
+
+---
+
+## 📋 修改清單總覽
+
+| # | 模組 | 問題 | 優先級 |
+|---|------|------|--------|
+| 1 | 打卡備註欄 | 無法輸入儲存 | 高 |
+| 2 | 後台全體 RWD | 手機版跑版 | 高 |
+| 3 | 排班編輯器 RWD | ScheduleGrid 手機版全黑 | 高 |
+| 4 | 跨日打卡配對 | 隔日無法打下班卡 | 高 |
+| 5 | 整天班誤發提醒 | 已打卡仍收到提醒 | 中 |
+| 6 | 下班打卡提醒 | 缺少下班未打卡通知 | 中 |
+| 7 | 晚打卡加班閉環 | 超時→申請→審核→計時的完整流程 | 中 |
+
+---
+
+## 🔧 FIX 1：打卡備註欄無法輸入儲存
+
+**問題：** 打卡記錄列表（attendance / clock-in list）的備註欄無法輸入或儲存。
+
+**後端修改：**
+
+1. 確認 `clock_records` 資料表是否有 `notes text` 欄位。
+   若無，使用 Drizzle ORM 新增 migration：
+   ```ts
+   // schema.ts 中 clockRecords 表新增
+   notes: text('notes'),
+   ```
+   執行 `drizzle-kit push` 或產生 migration 檔。
+
+2. 新增或確認 API 端點存在：
+   ```
+   PATCH /api/clock-records/:id
+   Body: { notes: string }
+   ```
+   回傳更新後的完整紀錄。
+
+3. 確認該 API 有正確的權限驗證（管理員才能編輯）。
+
+**前端修改：**
+
+1. 找到打卡列表中備註的 UI 元件，確認：
+   - 不是 `disabled` 也不是 `readOnly`
+   - 是 `<Input>` 或 `<Textarea>` 可編輯元件
+
+2. 加入 onBlur 儲存邏輯（失焦自動儲存）：
+   ```tsx
+   <Input
+     defaultValue={record.notes ?? ''}
+     placeholder="備註..."
+     className="text-xs text-gray-500 border-0 bg-transparent focus:bg-white focus:border-gray-200 transition-colors"
+     onBlur={(e) => {
+       if (e.target.value !== record.notes) {
+         updateClockNotes(record.id, e.target.value)
+       }
+     }}
+   />
+   ```
+
+3. 備註顯示規則（遵守 Skill）：
+   - 有備註時：`text-xs text-gray-500 italic` 顯示於打卡時間下方
+   - 空白時：顯示淡色 placeholder「點擊新增備註」
+
+**驗收：** 管理員在打卡列表輸入備註 → blur 後儲存 → 重新整理頁面備註仍在。
+
+---
+
+## 🔧 FIX 2：後台全體 RWD（所有頁面）
+
+**問題：** 後台管理介面在手機瀏覽器（375px）版面跑版。
+
+**修改規則（遵守 Skill 的 RWD 規範）：**
+
+### 2-A. 所有 Table 加 scroll wrapper
+
+掃描全專案所有含 `<Table>` 或 `<table>` 的頁面，外層包裹：
+```tsx
+<div className="overflow-x-auto w-full rounded-lg border border-gray-100">
+  <Table className="min-w-full">
+    ...
+  </Table>
+</div>
+```
+**這是最高優先級，缺少此 wrapper 是 RWD 跑版的主因。**
+
+### 2-B. 頁面操作列 flex 改為 responsive
+
+```tsx
+// 修改前（單行 flex，手機會溢出）
+<div className="flex items-center gap-2">
+
+// 修改後
+<div className="flex flex-col sm:flex-row items-start sm:items-center gap-2">
+```
+
+### 2-C. KPI 卡片 grid responsive
+
+```tsx
+<div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+```
+
+### 2-D. Dialog 手機版適配
+
+所有 `<DialogContent>` 加上：
+```tsx
+<DialogContent className="sm:max-w-md max-h-[90vh] overflow-y-auto mx-4">
+```
+
+### 2-E. 側邊欄 / Tab 導航 mobile 改 Sheet
+
+若頁面有側邊導航列，在 mobile 下改為 Shadcn `<Sheet>` 抽屜式，
+以 hamburger icon（`<Menu className="h-5 w-5" />`）觸發：
+```tsx
+const [open, setOpen] = useState(false)
+// mobile
+<Sheet open={open} onOpenChange={setOpen}>
+  <SheetTrigger asChild>
+    <Button variant="ghost" size="icon" className="md:hidden">
+      <Menu className="h-5 w-5" />
+    </Button>
+  </SheetTrigger>
+  <SheetContent side="left">...</SheetContent>
+</Sheet>
+// desktop：保持原有 Tabs 不變
+<div className="hidden md:block">...原有導航...</div>
+```
+
+### 2-F. 月份/日期選擇器 mobile 全寬
+
+```tsx
+<Select>
+  <SelectTrigger className="w-full sm:w-[180px]">
+```
+
+**驗收：** 在 375px 寬度下，所有後台頁面可正常瀏覽，不需橫向捲動。
+
+---
+
+## 🔧 FIX 3：排班編輯器（ScheduleGrid）手機版 RWD
+
+**問題：** 排班編輯器在手機上，日期欄在左側垂直排列，右側員工欄全黑空白，整個班表格無法顯示。
+
+**根本原因：** ScheduleGrid 是橫向的試算表式格子，手機版沒有水平捲動容器。
+
+**修改方式：**
+
+### 3-A. Grid 容器加 horizontal scroll
+
+找到 ScheduleGrid 的最外層容器，包裹：
+```tsx
+<div className="w-full overflow-x-auto -mx-4 px-4 sm:mx-0 sm:px-0">
+  <div style={{ minWidth: `${totalColumns * 120}px` }}>
+    {/* 原有 Grid 內容 */}
+  </div>
+</div>
+```
+
+`totalColumns` = 員工數 + 1（日期欄）
+
+### 3-B. 日期欄固定（Sticky）
+
+```tsx
+// 日期欄（最左欄）
+<div className="sticky left-0 z-20 bg-white border-r border-gray-100 w-[72px] shrink-0">
+  {date}
+</div>
+```
+
+### 3-C. 手機版欄寬縮小
+
+```tsx
+// 員工欄格子
+<div className="min-w-[90px] sm:min-w-[120px] ..."
+```
+
+### 3-D. 頂部工具列 wrap
+
+```tsx
+// 排班編輯器頂部的操作按鈕列
+<div className="flex flex-wrap gap-2 items-center mb-3">
+  <Button size="sm">匯入班表</Button>
+  <Button size="sm">固定排序</Button>
+  <Button size="sm">多選刪除</Button>
+  ...
+</div>
+```
+
+### 3-E. 區域 Tab 在手機捲動
+
+```tsx
+<div className="overflow-x-auto pb-1">
+  <div className="flex gap-1 min-w-max">
+    {regions.map(r => <Tab key={r.code} .../>)}
+  </div>
+</div>
+```
+
+**驗收：**
+1. 手機版班表可左右滑動瀏覽所有員工欄位
+2. 日期欄固定在左側不隨橫向捲動消失
+3. 點擊班次格子可正常開啟編輯 Dialog
+4. 區域 Tab（三蘆/松山/新竹/內勤）可橫向捲動選擇
+
+---
+
+## 🔧 FIX 4：跨日打卡配對邏輯
+
+**問題：** 員工 4/15 05:30 上班、4/16 01:00 下班，隔日無法打下班卡。
+這是常態班次（夜班），不是異常。
+
+**後端修改：**
+
+找到下班打卡的 API 處理邏輯，將「查詢當日班次」改為以下：
+
+```ts
+// 步驟1：查詢過去 28 小時內未配對的上班打卡
+const unpairedClockIn = await db.query.clockRecords.findFirst({
+  where: and(
+    eq(clockRecords.employeeId, employeeId),
+    eq(clockRecords.type, 'clock_in'),
+    isNull(clockRecords.clockOutId),           // 尚未配對
+    gte(clockRecords.clockTime,
+      sql`NOW() - INTERVAL '28 hours'`)        // 回溯 28 小時
+  ),
+  orderBy: desc(clockRecords.clockTime),       // 取最近一筆
+})
+
+if (!unpairedClockIn) {
+  return res.status(400).json({ error: '找不到對應的上班打卡紀錄' })
+}
+
+// 步驟2：計算工時（直接用 timestamp 差值，不用 date 比對）
+const workMinutes = differenceInMinutes(clockOutTime, unpairedClockIn.clockTime)
+// 跨日工時（例如 19.5h）是合法的，不拋錯
+
+// 步驟3：判斷是否超時（以原始班次 end_time 為基準）
+const shift = await db.query.shifts.findFirst({
+  where: eq(shifts.id, unpairedClockIn.shiftId)
+})
+
+// 跨日班次：若 end_time < start_time，end_timestamp 加一天
+let shiftEndTimestamp = combineDateAndTime(shift.date, shift.endTime)
+if (shift.endTime < shift.startTime) {
+  shiftEndTimestamp = addDays(shiftEndTimestamp, 1)
+}
+
+const isOvertime = isAfter(clockOutTime,
+  addMinutes(shiftEndTimestamp, 15))  // 超過 15 分鐘才算超時
+
+// 步驟4：更新配對
+await db.update(clockRecords)
+  .set({ clockOutId: newClockOutRecord.id })
+  .where(eq(clockRecords.id, unpairedClockIn.id))
+```
+
+**補打卡（amendment request）也套用相同 28 小時回溯邏輯。**
+
+**前台顯示修改：**
+
+```tsx
+// 班表格跨日班次顯示
+const displayTime = isOvernight(shift)
+  ? `${shift.startTime} → 翌${shift.endTime}`
+  : `${shift.startTime} – ${shift.endTime}`
+
+// 打卡紀錄列表，跨日下班時間
+const displayClockOut = isNextDay(clockIn.date, clockOut.date)
+  ? `翌日 ${format(clockOut.clockTime, 'HH:mm')}`
+  : format(clockOut.clockTime, 'HH:mm')
+```
+
+跨日班次 cell 樣式（遵守 Skill）：
+```tsx
+className="bg-indigo-50 border-l-4 border-indigo-400"
+```
+
+**驗收：**
+1. 4/15 05:30 上班打卡 → 成功
+2. 4/16 01:00 下班打卡 → 成功配對，工時顯示 19.5h
+3. 出勤列表顯示「翌日 01:00」
+4. 同一員工若有兩個班次，早班已配對不影響晚班
+
+---
+
+## 🔧 FIX 5：整天班打卡提醒誤發
+
+**問題：** 整天班員工已打上班卡，仍收到「未打卡提醒」LINE 通知。
+
+**後端修改（missing clock-in cron job）：**
+
+```ts
+// 每次 cron 執行，發送提醒前先做以下確認：
+
+// 確認1：該員工今日是否已有上班打卡
+const existingClockIn = await db.query.clockRecords.findFirst({
+  where: and(
+    eq(clockRecords.employeeId, employee.id),
+    eq(clockRecords.type, 'clock_in'),
+    gte(clockRecords.clockTime, startOfDay(today)),
+    // 跨日班次也要查：往前回溯到昨日 00:00
+    lte(clockRecords.clockTime, endOfDay(today))
+  )
+})
+
+// 若已打上班卡，跳過此員工，不發提醒
+if (existingClockIn) continue
+
+// 確認2：班次長度超過 8 小時，容忍時間從 15 分鐘延長為 30 分鐘
+const shiftDurationHours =
+  differenceInHours(shiftEnd, shiftStart)
+const toleranceMinutes = shiftDurationHours >= 8 ? 30 : 15
+
+const shouldAlert =
+  isAfter(now, addMinutes(shiftStart, toleranceMinutes))
+
+if (!shouldAlert) continue
+
+// 確認3：deduplication Set 去重
+const dedupKey = `${employee.id}-${shift.id}`
+if (sentAlerts.has(dedupKey)) continue
+sentAlerts.add(dedupKey)
+
+// 發送提醒
+await sendLinePush(employee.lineUserId, `⚠️ 上班打卡提醒 ...`)
+```
+
+**驗收：**
+1. 已打上班卡的員工，全天不再收到未打卡提醒
+2. 整天班（8h+）的提醒容忍時間正確為 30 分鐘
+3. 同一班次不重複發送
+
+---
+
+## 🔧 FIX 6：新增下班打卡提醒通知
+
+**問題：** 目前只有上班缺打卡提醒，缺少下班未打卡提醒。
+
+**需求：** 班次結束後 5 分鐘，若員工尚未打下班卡，發送 LINE 通知。
+
+**後端修改（在同一個 cron job 新增邏輯區塊）：**
+
+```ts
+// ── 下班打卡提醒區塊 ──────────────────────────
+
+// 查詢條件：
+// 1. 今日有班次且班次已結束 5 分鐘以上
+// 2. 有上班打卡紀錄
+// 3. 尚無下班打卡紀錄
+// 4. 班次結束時間在「本次 cron 執行時間的前 35 分鐘內」
+//    （只在「結束後 5~35 分鐘」這個窗口發送，避免重複）
+
+const clockOutReminderCandidates = await db.query.shifts.findMany({
+  where: and(
+    eq(shifts.regionCode, ...),
+    // 班次已結束 5 分鐘
+    lte(shiftEndTimestamp, subMinutes(now, 5)),
+    // 班次結束不超過 35 分鐘（窗口限制）
+    gte(shiftEndTimestamp, subMinutes(now, 35))
+  ),
+  with: { employee: true }
+})
+
+for (const shift of clockOutReminderCandidates) {
+  // 跨日班次：end_timestamp 加一天
+  let endTs = combineDateAndTime(shift.date, shift.endTime)
+  if (shift.endTime < shift.startTime) {
+    endTs = addDays(endTs, 1)
+  }
+
+  // 確認有上班打卡
+  const clockIn = await db.query.clockRecords.findFirst({
+    where: and(
+      eq(clockRecords.employeeId, shift.employeeId),
+      eq(clockRecords.type, 'clock_in'),
+      isNull(clockRecords.clockOutId)  // 尚未配對下班
+    )
+  })
+  if (!clockIn) continue
+
+  // deduplication
+  const dedupKey = `clockout-reminder-${shift.employeeId}-${shift.id}`
+  if (sentAlerts.has(dedupKey)) continue
+  sentAlerts.add(dedupKey)
+
+  // 發送 LINE push（只發給員工本人，不發 email）
+  await sendLinePush(shift.employee.lineUserId,
+    `⏰ 下班打卡提醒\n` +
+    `您在 ${shift.venueName} 的班次已於 ${shift.endTime} 結束\n` +
+    `請記得完成下班打卡！`
+  )
+}
+```
+
+**驗收：**
+1. 18:00 結束班次，18:05 前已打下班卡 → 不發通知
+2. 18:06 cron 執行時仍未打下班卡 → 發通知
+3. 同一班次只發一次
+4. 跨日班次（次日 01:00 結束）→ 01:05 後正確發送
+5. 請假當日無班次 → 不觸發
+
+---
+
+## 🔧 FIX 7：晚打卡→加班申請→審核→時數計算 完整閉環
+
+**問題：** 員工超時打卡後，加班申請→主管審核→時數納入計算的流程不完整。
+
+### 7-A. 下班打卡超時時的系統行為
+
+```ts
+// 員工下班打卡超過 shift.endTime + 15 分鐘時：
+
+if (isOvertime && clockOutReason === 'overtime') {
+  // A. 選擇「加班」→ 建立 overtime_requests
+  const existing = await db.query.overtimeRequests.findFirst({
+    where: eq(overtimeRequests.clockRecordId, clockRecord.id)
+  })
+  if (!existing) {
+    await db.insert(overtimeRequests).values({
+      employeeId,
+      shiftId: shift.id,
+      clockRecordId: clockRecord.id,
+      source: 'clock_triggered',
+      requestedMinutes: differenceInMinutes(clockOutTime, shiftEndTimestamp),
+      status: 'pending',
+    })
+  }
+  // 薪資報表先以 shift.endTime 計算，不含超時部分
+  await db.update(clockRecords)
+    .set({ isLateDeperature: true })
+    .where(eq(clockRecords.id, clockRecord.id))
+
+} else if (isOvertime && clockOutReason !== 'overtime') {
+  // B. 未申請加班 → 建立異常報表
+  await db.insert(anomalyReports).values({
+    employeeId,
+    shiftId: shift.id,
+    type: 'late_departure_no_ot_request',
+    occurredAt: clockOutTime,
+  })
+  await db.update(clockRecords)
+    .set({ isLateDeperature: true })
+    .where(eq(clockRecords.id, clockRecord.id))
+}
+```
+
+### 7-B. 主管審核後的時數更新
+
+```ts
+// PATCH /api/overtime-requests/:id
+// Body: { status: 'approved' | 'rejected', note?: string }
+
+if (status === 'approved') {
+  const clockRecord = await db.query.clockRecords.findFirst({
+    where: eq(clockRecords.id, overtimeRequest.clockRecordId)
+  })
+  const otHours =
+    differenceInMinutes(clockRecord.clockTime, shiftEndTimestamp) / 60
+
+  await db.update(overtimeRequests)
+    .set({
+      status: 'approved',
+      approvedHours: otHours,
+      resolvedAt: new Date(),
+    })
+    .where(eq(overtimeRequests.id, id))
+
+  // 下班打卡不再標記 is_late_departure（已核准）
+  await db.update(clockRecords)
+    .set({ isLateDeperature: false })
+    .where(eq(clockRecords.id, overtimeRequest.clockRecordId))
+
+} else if (status === 'rejected') {
+  await db.update(overtimeRequests)
+    .set({ status: 'rejected', resolvedAt: new Date() })
+    .where(eq(overtimeRequests.id, id))
+
+  // LINE 通知員工
+  await sendLinePush(employee.lineUserId,
+    `📋 加班申請結果通知\n` +
+    `您 ${format(shift.date, 'M/d')} 的加班申請未通過審核。\n` +
+    `如有疑問請聯繫主管。`
+  )
+}
+```
+
+### 7-C. 薪資報表顯示（遵守 Skill 色票規範）
+
+在 `/salary-report` 的員工工時列：
+
+```tsx
+// 加班欄顯示邏輯
+const renderOvertimeCell = (employee) => {
+  const pending = employee.overtimeRequests
+    .filter(r => r.status === 'pending')
+  const approved = employee.overtimeRequests
+    .filter(r => r.status === 'approved')
+
+  const approvedHours = approved.reduce((s, r) => s + r.approvedHours, 0)
+  const pendingHours = pending.reduce(
+    (s, r) => s + r.requestedMinutes / 60, 0)
+
+  return (
+    <TableCell>
+      {approvedHours > 0 && (
+        <span className="text-sm">{approvedHours.toFixed(1)}h</span>
+      )}
+      {pendingHours > 0 && (
+        // 遵守 Skill：amber 色表示待審核
+        <span className="text-xs text-amber-600 italic ml-1">
+          +{pendingHours.toFixed(1)}h（待審核）
+        </span>
+      )}
+      {approvedHours === 0 && pendingHours === 0 && (
+        <span className="text-gray-300">—</span>
+      )}
+    </TableCell>
+  )
+}
+```
+
+**驗收：**
+1. 超時打卡選「加班」→ overtime_requests 建立，pending
+2. 主管核准 → 薪資報表加班欄出現核准時數（黑色）
+3. 主管拒絕 → 加班欄不顯示，員工收到 LINE 通知
+4. 超時打卡未申請 → anomaly_reports 出現異常紀錄
+5. 薪資報表 pending 項目以 amber 斜體標示
+6. 核准後 is_late_departure 改為 false（不再顯示遲離標記）
+
+---
+
+## ✅ 全部驗收清單
+
+完成所有修改後，請依序確認：
+
+**打卡功能**
+- [ ] 備註欄可輸入並持久化儲存
+- [ ] 跨日班次（4/15 → 4/16）可正常配對下班打卡
+- [ ] 工時計算以 timestamp 差值為準，跨日工時正確
+
+**通知功能**
+- [ ] 已打上班卡的員工，全天不收到上班未打卡提醒
+- [ ] 整天班（8h+）容忍時間為 30 分鐘
+- [ ] 班次結束後 5 分鐘，未打下班卡發送提醒
+- [ ] 跨日班次的下班提醒時間正確（次日凌晨）
+
+**加班流程**
+- [ ] 超時打卡 → overtime_requests 自動建立
+- [ ] 主管核准 → 薪資報表計入加班時數
+- [ ] 主管拒絕 → LINE 通知員工
+- [ ] 薪資報表 pending 狀態以 amber 顯示
+
+**手機 RWD**
+- [ ] 所有 Table 有 overflow-x-auto wrapper
+- [ ] ScheduleGrid 可左右滑動，日期欄 sticky
+- [ ] Dialog 在手機版 max-h-[90vh] 不超出螢幕
+- [ ] 操作按鈕列在手機版 flex-wrap 換行
+- [ ] 375px 寬度下全後台頁面不需橫向捲動
