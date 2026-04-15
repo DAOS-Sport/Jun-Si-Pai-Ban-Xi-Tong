@@ -1,0 +1,530 @@
+# PT 排班系統｜前後台雙向連通 Master Prompt
+# 原則：不重構、不大幅改動畫面、只補斷點、強化邏輯連貫性
+# 執行前請先讀取：.claude/skills/pt-scheduling-brand/SKILL.md
+
+---
+
+## 核心方針
+
+本次修改只做三件事：
+1. **補斷點**：讓員工前台送出的請求，後台一定看得到、有地方處理
+2. **補回饋**：後台做的決定（審核/排班備註/公告），員工前台一定看得到
+3. **補邏輯**：讓現有功能之間的流程連貫，不再需要用LINE手動補洞
+
+所有修改沿用現有元件與資料表架構，最多新增欄位，不新增頁面（只新增區塊）。
+
+---
+
+## BRIDGE-01：班次備註雙向可見
+
+**斷點：** HR在排班時加了備註（UX-01已實作），但員工Portal的班表看不到。
+
+**後端：**
+`GET /api/employee/schedule`（員工Portal用的班表API）回傳的 shift 物件中，
+確認已包含 `notes` 欄位（shifts.notes）。
+
+**前端（Employee Portal）：**
+在員工個人班表的每個班次卡片上，若 `shift.notes` 有值，顯示說明區塊：
+```tsx
+{shift.notes && (
+  <div className="mt-2 pt-2 border-t border-blue-100 flex items-start gap-1.5">
+    <span className="text-blue-400 text-xs mt-0.5">📋</span>
+    <p className="text-xs text-blue-700 leading-relaxed">{shift.notes}</p>
+  </div>
+)}
+```
+
+**驗收：** HR在排班備註「本日使用補修，晚到2小時」→ 員工Portal班表卡片顯示此說明。
+
+---
+
+## BRIDGE-02：員工請假申請（Portal → Admin）
+
+**斷點：** 員工無法透過Portal申請請假，所有假別都要HR手動在排班上操作。
+
+**資料表：** 在現有 `clock_records` 相關表之外，新增：
+```sql
+ALTER TABLE shifts ADD COLUMN leave_request_id integer REFERENCES leave_requests(id);
+
+CREATE TABLE leave_requests (
+  id serial PRIMARY KEY,
+  employee_id integer NOT NULL REFERENCES employees(id),
+  date date NOT NULL,
+  leave_type text NOT NULL,  -- 休假/特休/病假/事假/喪假/公假
+  reason text,
+  status text NOT NULL DEFAULT 'pending',  -- pending/approved/rejected
+  admin_note text,
+  created_at timestamptz DEFAULT now(),
+  resolved_at timestamptz
+);
+```
+
+**後端 API：**
+```
+POST   /api/leave-requests          # 員工提交請假
+GET    /api/leave-requests          # 管理員查詢（?status=pending&regionCode=A）
+PATCH  /api/leave-requests/:id      # 管理員審核（approved/rejected）
+GET    /api/employee/leave-requests # 員工查詢自己的請假紀錄
+```
+
+**PATCH 審核時的連動邏輯：**
+```ts
+if (status === 'approved') {
+  // 自動在排班上建立對應假別班次
+  await db.insert(shifts).values({
+    employeeId: leaveRequest.employeeId,
+    date: leaveRequest.date,
+    shiftType: leaveRequest.leaveType,
+    startTime: '00:00',
+    endTime: '00:00',
+    notes: `員工申請：${leaveRequest.reason ?? ''}`,
+  })
+  // LINE通知員工
+  await sendLinePush(employee.lineUserId,
+    `✅ 請假核准\n${format(leaveRequest.date,'M/d')} ${leaveRequest.leaveType}已核准。`)
+} else {
+  await sendLinePush(employee.lineUserId,
+    `❌ 請假未核准\n${format(leaveRequest.date,'M/d')} 請假申請未通過。${adminNote ? `\n原因：${adminNote}` : ''}`)
+}
+```
+
+**前端（Employee Portal）：**
+在Portal「班表」頁簽旁新增「申請請假」按鈕（不新增頁面，用 Sheet 側抽屜）：
+```tsx
+<Sheet>
+  <SheetTrigger asChild>
+    <Button variant="outline" size="sm" className="gap-1.5">
+      申請請假
+    </Button>
+  </SheetTrigger>
+  <SheetContent side="bottom" className="h-auto rounded-t-xl">
+    <div className="space-y-4 p-4">
+      <h3 className="font-medium text-base">申請請假</h3>
+      {/* 日期選擇 */}
+      <DatePicker label="請假日期" value={date} onChange={setDate} />
+      {/* 假別選擇 */}
+      <Select label="假別" options={['特休','病假','事假','喪假','公假']} />
+      {/* 原因（選填） */}
+      <Textarea placeholder="備註說明（選填）" />
+      <Button className="w-full bg-blue-600 text-white" onClick={submit}>
+        送出申請
+      </Button>
+    </div>
+  </SheetContent>
+</Sheet>
+```
+
+在Portal「申請紀錄」區塊（現有 amendment requests 列表旁）新增請假申請列表，
+顯示日期、假別、狀態（待審/核准/未核准）。
+
+**前端（Admin）：**
+在出勤管理頁面的「補打卡申請」Tab旁新增「請假申請」Tab，
+顯示待審核列表，可一鍵核准或拒絕（拒絕時可輸入原因）。
+待審核數量整合進 BRIDGE-07 的 pending-counts API。
+
+**驗收：**
+1. 員工Portal可送出請假申請
+2. 管理後台「請假申請」Tab顯示待審清單
+3. 核准後排班自動出現假別班次
+4. 員工收到LINE通知審核結果
+5. Portal申請紀錄顯示狀態
+
+---
+
+## BRIDGE-03：申請狀態追蹤（補打卡 / 加班 / 請假）
+
+**斷點：** 員工送出補打卡或加班申請後，在Portal完全看不到進度。
+
+**後端：** 新增統一查詢 API：
+```
+GET /api/employee/my-requests
+Response: {
+  clockAmendments: Array<{ id, date, requestedTime, status, adminNote, createdAt }>,
+  overtimeRequests: Array<{ id, date, requestedHours, status, adminNote, createdAt }>,
+  leaveRequests:    Array<{ id, date, leaveType, status, adminNote, createdAt }>
+}
+```
+
+**前端（Employee Portal）：**
+在Portal現有頁面底部新增「我的申請」摺疊區塊（預設收合）：
+```tsx
+<Collapsible>
+  <CollapsibleTrigger className="w-full flex items-center justify-between py-3 border-t">
+    <span className="text-sm font-medium">我的申請紀錄</span>
+    <div className="flex items-center gap-2">
+      {pendingCount > 0 && (
+        <span className="bg-amber-100 text-amber-700 text-xs px-2 py-0.5 rounded-full">
+          {pendingCount} 筆待審
+        </span>
+      )}
+      <ChevronDown className="h-4 w-4 text-gray-400" />
+    </div>
+  </CollapsibleTrigger>
+  <CollapsibleContent>
+    {/* 三種申請類型 Tab */}
+    <Tabs defaultValue="leave">
+      <TabsList className="w-full">
+        <TabsTrigger value="leave">請假</TabsTrigger>
+        <TabsTrigger value="clock">補打卡</TabsTrigger>
+        <TabsTrigger value="overtime">加班</TabsTrigger>
+      </TabsList>
+      {/* 每種類型的列表 */}
+      {requests.map(r => (
+        <div key={r.id} className="flex items-center justify-between py-2 border-b border-gray-50">
+          <div>
+            <p className="text-sm">{format(r.date,'M/d')} {r.leaveType ?? r.requestedTime}</p>
+            {r.adminNote && <p className="text-xs text-gray-400">{r.adminNote}</p>}
+          </div>
+          <StatusBadge status={r.status} />
+        </div>
+      ))}
+    </Tabs>
+  </CollapsibleContent>
+</Collapsible>
+```
+
+`StatusBadge` 遵守 Skill 色票：
+- pending → `bg-amber-100 text-amber-700`「待審核」
+- approved → `bg-green-100 text-green-700`「已核准」
+- rejected → `bg-red-100 text-red-700`「未通過」
+
+**驗收：**
+1. Portal可看到所有三種申請的最新狀態
+2. 有待審申請時顯示數量提示
+3. 核准/拒絕後狀態即時更新（React Query refetch）
+
+---
+
+## BRIDGE-04：HR公告推送至員工Portal
+
+**斷點：** HR無法主動對員工Portal發布公告或通知，只能透過LINE群組。
+
+**資料表：**
+```sql
+CREATE TABLE announcements (
+  id serial PRIMARY KEY,
+  title text NOT NULL,
+  content text NOT NULL,
+  target_region text,        -- NULL=全員, A/B/C/D=指定戰區
+  published_at timestamptz DEFAULT now(),
+  expires_at timestamptz,    -- NULL=永不過期
+  created_by integer REFERENCES employees(id)
+);
+```
+
+**後端 API：**
+```
+POST /api/announcements          # HR發布（admin only）
+GET  /api/announcements/active   # 員工查詢有效公告（自動過濾 expires_at）
+```
+
+**前端（Admin）：**
+在現有「員工管理」頁面旁新增「公告管理」入口（不新增頁面，用 Dialog）：
+```tsx
+<Button variant="outline" size="sm" onClick={() => setAnnouncementDialogOpen(true)}>
+  發布公告
+</Button>
+
+<Dialog open={announcementDialogOpen}>
+  <DialogContent className="sm:max-w-md max-h-[90vh] overflow-y-auto mx-4">
+    <DialogHeader><DialogTitle>發布公告</DialogTitle></DialogHeader>
+    <div className="space-y-3">
+      <Input placeholder="公告標題" />
+      <Textarea placeholder="公告內容" className="h-24" />
+      <Select label="發送對象" options={['全員','三蘆戰區','松山國小','新竹區','內勤']} />
+      <DatePicker label="到期日（選填）" />
+      <div className="flex gap-2">
+        <Button className="flex-1" onClick={publish}>發布</Button>
+        <Button variant="outline" onClick={() => setOpen(false)}>取消</Button>
+      </div>
+    </div>
+  </DialogContent>
+</Dialog>
+```
+
+發布時同步發送 LINE broadcast（若有設定 LINE channel）。
+
+**前端（Employee Portal）：**
+在Portal頂部（班表前）顯示有效公告，
+未讀公告以藍色 banner 呈現，點擊展開後標記為已讀：
+```tsx
+{activeAnnouncements.map(ann => (
+  <div key={ann.id}
+    className="bg-blue-50 border border-blue-100 rounded-lg p-3 mb-3 cursor-pointer"
+    onClick={() => markRead(ann.id)}
+  >
+    <div className="flex items-start justify-between gap-2">
+      <div>
+        <p className="text-sm font-medium text-blue-800">{ann.title}</p>
+        {expandedId === ann.id && (
+          <p className="text-xs text-blue-700 mt-1 leading-relaxed">{ann.content}</p>
+        )}
+      </div>
+      <span className="text-xs text-blue-400 shrink-0">
+        {format(ann.publishedAt,'M/d')}
+      </span>
+    </div>
+  </div>
+))}
+```
+
+**驗收：**
+1. HR後台可發布公告並指定對象
+2. 員工Portal頂部顯示有效公告
+3. 過期公告自動消失
+4. 點擊後展開完整內容
+
+---
+
+## BRIDGE-05：月工時確認機制
+
+**斷點：** 薪資計算完全由HR單方面產出，員工無法確認或提出異議。
+
+**資料表：**
+```sql
+ALTER TABLE employees ADD COLUMN monthly_hours_confirmed_at timestamptz;
+ALTER TABLE employees ADD COLUMN monthly_hours_confirmed_month text; -- 'yyyy-MM'
+```
+
+**後端 API：**
+```
+GET  /api/employee/monthly-summary?year=&month=  # 員工查看自己的月工時摘要
+POST /api/employee/monthly-summary/confirm       # 員工確認工時
+Body: { year: number, month: number }
+```
+
+**前端（Employee Portal）：**
+在Portal「班表」頁簽旁新增「本月工時」摘要卡片（數字展示，不需複雜UI）：
+```tsx
+<div className="bg-gray-50 rounded-xl p-4 mb-4">
+  <div className="flex items-center justify-between mb-3">
+    <span className="text-sm font-medium">{month}月工時摘要</span>
+    {!isConfirmed ? (
+      <Button size="sm" variant="outline"
+        className="text-xs h-7 border-green-200 text-green-700 hover:bg-green-50"
+        onClick={confirmHours}>
+        確認無誤
+      </Button>
+    ) : (
+      <span className="text-xs text-green-600">✓ 已確認</span>
+    )}
+  </div>
+  <div className="grid grid-cols-3 gap-3">
+    <div className="text-center">
+      <p className="text-xl font-medium">{summary.totalHours}</p>
+      <p className="text-xs text-gray-400">總工時</p>
+    </div>
+    <div className="text-center">
+      <p className="text-xl font-medium text-indigo-600">{summary.overtimeHours}</p>
+      <p className="text-xs text-gray-400">加班時數</p>
+    </div>
+    <div className="text-center">
+      <p className="text-xl font-medium">{summary.shiftCount}</p>
+      <p className="text-xs text-gray-400">班次數</p>
+    </div>
+  </div>
+</div>
+```
+
+**前端（Admin）：**
+在薪資報表（/salary-report）的員工列中，新增「已確認」欄位（綠勾 / 灰橫線）。
+新增篩選：只看「未確認」員工，方便HR催確認。
+
+**驗收：**
+1. 員工Portal可查看本月工時摘要
+2. 員工確認後薪資報表標記「已確認」
+3. HR可篩選查看未確認員工名單
+
+---
+
+## BRIDGE-06：異常回報閉環（Portal → Admin → Portal）
+
+**斷點：** 員工提交異常回報後，不知道HR有沒有看到、有沒有處理。
+
+**後端：**
+`GET /api/employee/my-anomaly-reports` — 員工查看自己提交的異常回報列表，
+包含 `resolution` 和 `resolvedNote` 欄位（anomaly_reports 表已有）。
+
+PATCH `/api/anomaly-reports/:id` 審核完畢時，
+若 `resolution` 設為 resolved，自動推送 LINE 通知員工：
+```ts
+if (resolution === 'resolved') {
+  await sendLinePush(employee.lineUserId,
+    `✅ 異常回報已處理\n` +
+    `您 ${format(report.occurredAt,'M/d')} 的回報已處理完畢。` +
+    `${resolvedNote ? `\n說明：${resolvedNote}` : ''}`)
+}
+```
+
+**前端（Employee Portal）：**
+將異常回報的歷史紀錄整合進 BRIDGE-03 的「我的申請」區塊，
+新增第四個 Tab「異常回報」，顯示每筆回報的狀態（處理中/已處理）與說明。
+
+**驗收：**
+1. 員工Portal可查看自己提交的所有異常回報
+2. HR處理完畢後員工收到LINE通知
+3. Portal顯示處理結果說明
+
+---
+
+## BRIDGE-07：待審核集中計數（邏輯連貫）
+
+**斷點：** 現有各種待審核申請（補打卡/加班/請假/異常）分散在不同頁面，
+HR沒有統一入口知道今天需要處理什麼。
+
+**後端：** 擴充現有（或新增）計數 API：
+```
+GET /api/pending-counts
+Response: {
+  clockAmendments: number,
+  overtimeRequests: number,
+  leaveRequests: number,      // 新增
+  anomalyReports: number,
+  total: number               // 四項加總
+}
+```
+
+**前端（Admin）：**
+在後台頂部導航列，每個對應頁面的連結旁顯示數字 Badge（參考 UX-07）。
+新增一個「今日待辦」摘要卡片在首頁儀表板（若有）或排班頁頂部：
+```tsx
+{pendingCounts.total > 0 && (
+  <div className="bg-amber-50 border border-amber-100 rounded-lg p-3 mb-4
+                  flex items-center justify-between">
+    <div className="flex items-center gap-2">
+      <span className="text-amber-600 text-sm font-medium">
+        有 {pendingCounts.total} 筆待處理
+      </span>
+      <div className="flex gap-1.5 text-xs text-amber-500">
+        {pendingCounts.leaveRequests > 0 &&
+          <span>請假申請 {pendingCounts.leaveRequests}</span>}
+        {pendingCounts.clockAmendments > 0 &&
+          <span>補打卡 {pendingCounts.clockAmendments}</span>}
+        {pendingCounts.overtimeRequests > 0 &&
+          <span>加班 {pendingCounts.overtimeRequests}</span>}
+      </div>
+    </div>
+    <Button size="sm" variant="ghost" className="text-amber-600 text-xs h-7"
+      onClick={() => navigate('/attendance')}>
+      前往處理
+    </Button>
+  </div>
+)}
+```
+
+**驗收：**
+1. 後台頂部導航對應頁面有數字Badge
+2. 任何頁面頂部的「今日待辦」banner正確顯示各類型待審數
+3. 每5分鐘自動刷新
+
+---
+
+## BRIDGE-08：邏輯連貫性修補
+
+以下為現有功能之間的邏輯斷點，逐一補齊：
+
+### 8-A：補打卡申請核准後自動連動出勤報表
+
+**斷點：** 補打卡申請核准後，週出勤報表（/weekly-attendance）的狀態仍顯示 missing。
+
+```ts
+// PATCH /api/clock-amendments/:id 核准時
+if (status === 'approved') {
+  // 建立實際打卡紀錄
+  await db.insert(clockRecords).values({
+    employeeId: amendment.employeeId,
+    shiftId: amendment.shiftId,
+    type: amendment.type,          // clock_in or clock_out
+    clockTime: amendment.requestedTime,
+    isAmendment: true,
+    amendmentId: amendment.id,
+  })
+  // 週出勤報表查詢時會自動包含此筆，不需額外更新
+}
+```
+
+### 8-B：加班時數核准後自動出現在薪資報表
+
+**斷點：** 確認 `GET /api/salary-report` 的加班時數計算，
+使用 `overtimeRequests.approvedHours`（WHERE status='approved'），
+而非用 clock_out 時間直接計算。若目前用後者，改為前者。
+
+```ts
+// 薪資報表 overtime 計算方式
+const overtimeHours = await db
+  .select({ total: sum(overtimeRequests.approvedHours) })
+  .from(overtimeRequests)
+  .where(and(
+    eq(overtimeRequests.employeeId, emp.id),
+    eq(overtimeRequests.status, 'approved'),
+    between(overtimeRequests.createdAt, monthStart, monthEnd)
+  ))
+```
+
+### 8-C：請假班次繞過缺打卡提醒
+
+**斷點：** 員工有假別班次（休假/特休等）當天，仍可能收到缺打卡提醒。
+
+```ts
+// missing clock-in cron job 中，額外排除假別班次
+const isLeaveShift = ['休假','特休','病假','事假','喪假','公假']
+  .includes(shift.shiftType)
+if (isLeaveShift) continue  // 假別班次不發提醒
+```
+
+### 8-D：跨區支援員工的出勤歸屬
+
+**斷點：** isDispatch=true 的員工打卡時，出勤記錄歸屬在原區域，
+但班次顯示在目標區域，造成週出勤報表的地區對不上。
+
+在打卡記錄建立時，附加 `venueId` 欄位（若 clock_records 尚未有此欄）：
+```sql
+ALTER TABLE clock_records ADD COLUMN venue_id integer REFERENCES venues(id);
+```
+
+打卡時從 shift 取得 venueId 並儲存，出勤報表依 venueId 的 regionCode 歸類，
+不依 employee 本身的 regionCode。
+
+### 8-E：班次提醒與打卡提醒不重複觸發
+
+**斷點：** 班次開始前的「班次提醒」和開始後15分鐘的「缺打卡提醒」，
+可能對同一員工連續發出兩則通知，觀感不佳。
+
+```ts
+// 缺打卡 cron 中，排除「30分鐘內已收過班次提醒」的員工
+const recentShiftReminder = await db.query.notificationLogs.findFirst({
+  where: and(
+    eq(notificationLogs.employeeId, employee.id),
+    eq(notificationLogs.type, 'shift_reminder'),
+    gte(notificationLogs.sentAt, subMinutes(now, 30))
+  )
+})
+if (recentShiftReminder) continue  // 跳過，避免連發
+```
+
+（若目前沒有 notificationLogs 表，只需新增此表記錄已發送的通知類型與時間）
+
+---
+
+## ✅ 完整驗收清單
+
+**前台 → 後台（員工操作，HR接收）**
+- [ ] 員工Portal可送出請假申請（BRIDGE-02）
+- [ ] 後台請假申請Tab顯示待審清單
+- [ ] 後台「今日待辦」banner涵蓋所有申請類型（BRIDGE-07）
+
+**後台 → 前台（HR操作，員工接收）**
+- [ ] 班次備註在Portal班表卡片可見（BRIDGE-01）
+- [ ] HR公告在Portal頂部顯示（BRIDGE-04）
+- [ ] 所有審核結果員工Portal可追蹤（BRIDGE-03）
+- [ ] 工時確認後HR薪資報表標記（BRIDGE-05）
+
+**閉環回饋**
+- [ ] 異常回報處理後員工收到通知（BRIDGE-06）
+- [ ] 補打卡核准後出勤報表自動更新（BRIDGE-08A）
+- [ ] 加班核准後薪資報表正確計算（BRIDGE-08B）
+
+**邏輯連貫**
+- [ ] 假別班次不觸發缺打卡提醒（BRIDGE-08C）
+- [ ] 跨區員工出勤歸屬正確（BRIDGE-08D）
+- [ ] 班次提醒與缺打卡提醒不重複（BRIDGE-08E）
