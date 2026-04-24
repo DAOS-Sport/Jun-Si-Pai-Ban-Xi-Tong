@@ -1,0 +1,241 @@
+你現在是本專案的 Senior Backend Engineer（TypeScript / Express / Replit）。
+
+請直接修改班表系統，新增一組「只讀 Internal Export API」，供 400qian-duan-yi-biao-ban 工作台 BFF 抓取班表原始資料後自行處理。
+
+目標：
+不要替工作台做過度加工，不要只回 summary。
+請盡量把班表原始資料、關聯資料、欄位 ID、員工、場館、班別、派遣、異動狀態都完整輸出成 JSON。
+工作台端會自行做：
+- 館別映射
+- 早班 / 晚班 / 中班判斷
+- 交班事項自動配對
+- 主管端當班 / 下個當班人員
+- 員工端今日班表渲染
+
+驗證：
+所有 /api/internal/export/* 都必須：
+- 只回 JSON，永不回 HTML
+- 需要 INTERNAL_API_TOKEN
+- 支援 Authorization: Bearer、X-Internal-Token、X-API-Key 三種 header
+- 無 token 回 401 MISSING_INTERNAL_TOKEN
+- 錯 token 回 403 INVALID_INTERNAL_TOKEN
+- 不存在路由回 404 INTERNAL_ROUTE_NOT_FOUND JSON
+
+請新增以下 API：
+
+1. GET /api/internal/export/schedules
+用途：匯出指定日期範圍內所有班表原始資料。
+
+Query:
+- from=YYYY-MM-DD 必填
+- to=YYYY-MM-DD 必填
+- facilityKey 可選，A/B/C/D 或場館 key
+- employeeNumber 可選
+- includeDeleted=true/false，預設 false
+- includeDispatch=true/false，預設 true
+- limit 預設 5000
+- cursor 可選
+
+Response:
+{
+  "items": [
+    {
+      "rawId": "...",
+      "sourceTable": "...",
+      "sourceRowId": "...",
+      "date": "2026-04-24",
+      "region": {
+        "id": 1,
+        "code": "A",
+        "name": "三蘆戰區"
+      },
+      "venue": {
+        "id": "...",
+        "key": "...",
+        "name": "新北高中游泳池&運動中心",
+        "aliases": ["新北高中", "新北"]
+      },
+      "shift": {
+        "id": "...",
+        "code": "...",
+        "name": "早班",
+        "label": "早班",
+        "startTime": "08:00:00",
+        "endTime": "16:00:00",
+        "startAt": "2026-04-24T08:00:00+08:00",
+        "endAt": "2026-04-24T16:00:00+08:00",
+        "period": "early | mid | late | custom",
+        "rawPeriod": "原始班別欄位"
+      },
+      "employee": {
+        "id": "...",
+        "employeeNumber": "A001",
+        "name": "王小明",
+        "title": "櫃台",
+        "department": "新北高中",
+        "status": "active"
+      },
+      "assignment": {
+        "kind": "regular | dispatch | substitute | support",
+        "status": "scheduled | changed | cancelled | completed",
+        "isDispatch": false,
+        "isSubstitute": false,
+        "dispatchFromVenue": null,
+        "dispatchToVenue": null,
+        "note": ""
+      },
+      "audit": {
+        "createdAt": "...",
+        "updatedAt": "...",
+        "deletedAt": null,
+        "updatedBy": ""
+      },
+      "raw": {
+        "請保留原始資料列，方便工作台 BFF 追欄位"
+      }
+    }
+  ],
+  "pageInfo": {
+    "limit": 5000,
+    "nextCursor": null,
+    "hasMore": false
+  },
+  "generatedAt": "2026-04-24T12:00:00+08:00"
+}
+
+2. GET /api/internal/export/employees
+用途：匯出班表系統內員工索引，供工作台比對 Ragic。
+
+Query:
+- status=active|all，預設 active
+- facilityKey 可選
+- limit 預設 5000
+- cursor 可選
+
+Response:
+{
+  "items": [
+    {
+      "id": "...",
+      "employeeNumber": "A001",
+      "name": "王小明",
+      "title": "櫃台",
+      "department": "新北高中",
+      "regionCode": "A",
+      "venueKeys": ["xinbei_pool"],
+      "status": "active",
+      "raw": {}
+    }
+  ],
+  "pageInfo": { "limit": 5000, "nextCursor": null, "hasMore": false },
+  "generatedAt": "..."
+}
+
+3. GET /api/internal/export/venues
+用途：匯出場館與戰區對照表。
+
+Response:
+{
+  "items": [
+    {
+      "id": "...",
+      "key": "xinbei_pool",
+      "name": "新北高中游泳池&運動中心",
+      "shortName": "新北",
+      "regionCode": "A",
+      "regionName": "三蘆戰區",
+      "aliases": ["新北高中", "新北高中游泳池", "新北"],
+      "lineGroupId": null,
+      "isActive": true,
+      "raw": {}
+    }
+  ],
+  "generatedAt": "..."
+}
+
+4. GET /api/internal/export/shifts
+用途：匯出班別定義表。
+
+Response:
+{
+  "items": [
+    {
+      "id": "...",
+      "code": "early",
+      "name": "早班",
+      "label": "早班",
+      "startTime": "08:00:00",
+      "endTime": "16:00:00",
+      "period": "early",
+      "sortOrder": 10,
+      "raw": {}
+    }
+  ],
+  "generatedAt": "..."
+}
+
+5. GET /api/internal/export/changes
+用途：匯出班表異動紀錄，讓工作台知道調班、取消、代班、派遣。
+
+Query:
+- from=YYYY-MM-DD
+- to=YYYY-MM-DD
+- facilityKey 可選
+- limit 預設 5000
+- cursor 可選
+
+Response:
+{
+  "items": [
+    {
+      "id": "...",
+      "scheduleRawId": "...",
+      "date": "2026-04-24",
+      "changeType": "create | update | cancel | substitute | dispatch",
+      "before": {},
+      "after": {},
+      "reason": "",
+      "changedBy": "",
+      "changedAt": "..."
+    }
+  ],
+  "pageInfo": { "limit": 5000, "nextCursor": null, "hasMore": false },
+  "generatedAt": "..."
+}
+
+6. GET /api/internal/export/snapshot
+用途：一次匯出工作台最常用的一包資料。適合 BFF 每次重整或排程抓取。
+
+Query:
+- from=YYYY-MM-DD
+- to=YYYY-MM-DD
+- facilityKey 可選
+
+Response:
+{
+  "range": { "from": "2026-04-24", "to": "2026-04-30" },
+  "venues": [],
+  "shifts": [],
+  "employees": [],
+  "schedules": [],
+  "changes": [],
+  "generatedAt": "..."
+}
+
+重要規則：
+- 請保留 raw 欄位，不要刪掉原始資料。
+- 請回傳穩定 id：rawId/sourceRowId/shift.id/employee.employeeNumber/venue.key。
+- 如果目前沒有 venue.key，請先用內部 id 或名稱產生穩定 key，但要保留 raw。
+- 日期與時間請同時提供 date、startTime/endTime、startAt/endAt。
+- startAt/endAt 必須帶 Asia/Taipei offset，例如 +08:00。
+- period 如果無法準確判斷，可以先回 custom，但 rawPeriod 必須保留。
+- API 是 read-only，不要新增寫入功能。
+- 不要新增 UI。
+- 不要破壞原本 /api/internal/admin/overview 與 /api/internal/schedules/today。
+
+最後請輸出：
+1. 修改檔案清單
+2. 新增 API 清單
+3. smoke test 結果
+4. curl 範例
+5. 實際 response sample
